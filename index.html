@@ -135,6 +135,12 @@
     const lockBtn = document.getElementById('lock');
     const autorunBtn = document.getElementById('autorun');
 
+    // 트레일 전환(크로스페이드) 애니메이션 관리
+    const transitions = []; // { start, duration, fromLine, toLine, fromOpacity, toOpacity }
+
+    // done 이후: 최종 트레일 반복 모드
+    let loopFinal = false;
+
     const sliderEls = [samplesEl, circlesEl, speedEl, scaleEl];
 
     samplesEl.addEventListener('input', () => samplesVal.textContent = samplesEl.value);
@@ -379,6 +385,50 @@
       return new THREE.Line(geom, material);
     }
 
+    function makeGradientGhostLineFromTrailPoints(trailPtsXY, ghostOpacity) {
+      // trailPtsXY: [{x,y}, ...]
+      const pts3 = trailPtsXY.map(v => new THREE.Vector3(v.x, v.y, 0));
+      const geom = new THREE.BufferGeometry().setFromPoints(pts3);
+    
+      // vertex color: blue -> gray
+      const blue = new THREE.Color(0x4aa3ff);
+      const gray = new THREE.Color(0x9a9a9a);
+    
+      const n = pts3.length;
+      const colors = new Float32Array(n * 3);
+    
+      for (let i = 0; i < n; i++) {
+        const a = (n <= 1) ? 1 : (i / (n - 1));         // 0..1
+        const c = blue.clone().lerp(gray, a);          // blue -> gray
+        colors[i * 3 + 0] = c.r;
+        colors[i * 3 + 1] = c.g;
+        colors[i * 3 + 2] = c.b;
+      }
+    
+      geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    
+      const mat = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0 // 시작은 0, 크로스페이드로 올림
+      });
+    
+      const line = new THREE.Line(geom, mat);
+      line.userData.targetOpacity = ghostOpacity;
+      return line;
+    }
+    
+    function startCrossFade(fromLine, toLine, durationSec, toOpacity) {
+      transitions.push({
+        start: performance.now(),
+        duration: Math.max(0.05, durationSec) * 1000,
+        fromLine,
+        toLine,
+        fromOpacity: fromLine?.material?.opacity ?? 1,
+        toOpacity
+      });
+    }    
+
     function updateArmsAndCircles(joints) {
       const armPts = joints.map(p => new THREE.Vector3(p.x, p.y, 0));
       if (!armsLine) {
@@ -474,20 +524,31 @@
     // -----------------------
     // 드로잉 완료 처리: trail을 ghost로 옮기고 옅게 표시
     // -----------------------
-    function finalizeCurrentTrailAsGhost() {
-      if (!trailLine) return;
-
-      // 현재 trailLine을 group에서 빼서 ghostsGroup에 넣고, material을 옅게 바꿈
-      group.remove(trailLine);
-
-      // material/geometry 복사(현재 것을 그대로 ghost로 사용)
-      trailLine.material.opacity = autoRun.ghostOpacity;
-      trailLine.material.color.setHex(0xaaaaaa);
-      trailLine.material.needsUpdate = true;
-
-      ghostsGroup.add(trailLine);
-      trailLine = null; // 다음 드로잉을 위해 새 trail을 만들게 함
+    function finalizeCurrentTrailAsGhostSmooth() {
+      if (!trailLine || trailPoints.length < 2) {
+        // 다음 드로잉 대비 초기화
+        trailLine = null;
+        trailPoints = [];
+        return;
+      }
+    
+      // 1) 현재 trail(파란색) line을 group에서 분리하지 않고 유지한 채,
+      // 2) 동일 포인트로 그라데이션 ghost line 생성해서 ghostsGroup에 추가
+      const ghost = makeGradientGhostLineFromTrailPoints(trailPoints, autoRun.ghostOpacity);
+      ghostsGroup.add(ghost);
+    
+      // 3) 크로스페이드 시작: 파란 선은 0으로, ghost는 ghostOpacity로
+      // 파란 선 색은 그대로 두고 opacity만 내리면 자연스럽다.
+      startCrossFade(trailLine, ghost, 0.8, autoRun.ghostOpacity);
+    
+      // 4) 다음 드로잉을 위해 새 trail을 만들 수 있도록 분리
+      // (지금 trailLine은 전환 애니메이션 끝나면 제거할 것)
+      const oldTrail = trailLine;
+      trailLine = null;
       trailPoints = [];
+    
+      // 전환 완료 후 oldTrail 제거 예약을 userData로 표시
+      oldTrail.userData.removeAfterFade = true;
     }
 
     // -----------------------
@@ -538,6 +599,28 @@
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
 
+      // --- transitions 업데이트(크로스페이드) ---
+      if (transitions.length) {
+        const nowMs = performance.now();
+        for (let i = transitions.length - 1; i >= 0; i--) {
+          const tr = transitions[i];
+          const u = Math.min(1, Math.max(0, (nowMs - tr.start) / tr.duration));
+      
+          if (tr.fromLine?.material) tr.fromLine.material.opacity = tr.fromOpacity * (1 - u);
+          if (tr.toLine?.material) tr.toLine.material.opacity = tr.toOpacity * u;
+      
+          if (u >= 1) {
+            // 끝: fromLine 제거(옵션)
+            if (tr.fromLine?.userData?.removeAfterFade) {
+              group.remove(tr.fromLine);
+              tr.fromLine.geometry?.dispose?.();
+              tr.fromLine.material?.dispose?.();
+            }
+            transitions.splice(i, 1);
+          }
+        }
+      }      
+
       // scale은 항상 반영 (슬라이더가 disable이어도 값은 유지됨)
       const uiScale = parseFloat(scaleEl.value);
       group.scale.setScalar(uiScale);
@@ -567,24 +650,30 @@
       // ---- (요구사항 3) 한 바퀴(드로잉 1회) 완료 감지 ----
       // t가 0으로 래핑되면 "한 번의 드로잉 끝"
       if (autoRun.enabled && autoRun.isRunning) {
-        if (prevT > t) { // wrap
-          finalizeCurrentTrailAsGhost(); // 끝난 trail을 옅게 남김(ghost)
-
-          let cur = parseInt(circlesEl.value, 10);
-          if (cur < autoRun.max) {
-            cur = Math.min(autoRun.max, cur + autoRun.step);
-            circlesEl.value = String(cur);
-            circlesVal.textContent = circlesEl.value;
-
-            // 다음 드로잉 시작
+        if (prevT > t) { // wrap: 한 바퀴 끝
+          if (autoRun.enabled && autoRun.isRunning) {
+            finalizeCurrentTrailAsGhostSmooth();
+        
+            let cur = parseInt(circlesEl.value, 10);
+            if (cur < autoRun.max) {
+              cur = Math.min(autoRun.max, cur + autoRun.step);
+              circlesEl.value = String(cur);
+              circlesVal.textContent = circlesEl.value;
+              t = 0;
+            } else {
+              autoRun.isRunning = false;
+              loopFinal = true;
+              circlesEl.value = String(autoRun.max);
+              circlesVal.textContent = circlesEl.value;
+              setStatus('done(loop)');
+              setSlidersEnabled(true);
+              t = 0;
+              // 여기서 finalize는 이미 위에서 됨
+            }
+          } else if (loopFinal) {
+            // 최종 트레일 무한 반복: ghost로 넘기지 않고, 현재 트레일만 새로 그림
+            clearTrail(false); // 현재 파란 trail만 비움 (ghost는 유지)
             t = 0;
-          } else {
-            // max까지 완료 → 최종도 ghost처럼 옅게 남기고 멈춤(원하면 멈추지 않게 바꿔도 됨)
-            autoRun.isRunning = false;
-            setStatus('done');
-            setSlidersEnabled(true);   // 완료 후 사용자가 만질 수 있게
-            paused = true;
-            document.getElementById('pause').textContent = 'Resume';
           }
         }
       }
@@ -598,4 +687,5 @@
   </script>
 </body>
 </html>
+
 
