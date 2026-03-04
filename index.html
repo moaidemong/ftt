@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FFT Epicycle Drawing (Three.js)</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #ddd; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #ui {
+      position: fixed; top: 12px; left: 12px; z-index: 10;
+      background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.15);
+      padding: 10px 12px; border-radius: 10px; backdrop-filter: blur(6px);
+      display: flex; flex-direction: column; gap: 8px; min-width: 320px;
+    }
+    #ui .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #ui label { font-size: 12px; opacity: .9; }
+    #ui input[type="range"] { width: 220px; }
+    #ui small { opacity: .75; line-height: 1.35; }
+    a { color: #9ad; }
+  </style>
+
+  <!-- Import Map: browser에서 three + addons(SVGLoader) 쓰기 -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="ui">
+    <div class="row">
+      <input id="file" type="file" accept=".svg,image/svg+xml" />
+      <button id="demo">Demo SVG</button>
+    </div>
+
+    <div class="row">
+      <label>Samples</label>
+      <input id="samples" type="range" min="256" max="4096" step="256" value="2048" />
+      <span id="samplesVal">2048</span>
+    </div>
+
+    <div class="row">
+      <label>Circles</label>
+      <input id="circles" type="range" min="10" max="800" step="10" value="250" />
+      <span id="circlesVal">250</span>
+    </div>
+
+    <div class="row">
+      <label>Speed</label>
+      <input id="speed" type="range" min="0.1" max="3.0" step="0.1" value="1.0" />
+      <span id="speedVal">1.0</span>
+    </div>
+
+    <div class="row">
+      <button id="restart">Restart</button>
+      <button id="pause">Pause</button>
+      <button id="clear">Clear Trail</button>
+    </div>
+
+    <small>
+      1) SVG 업로드 → 2) DFT(FFT 개념)로 계수 계산 → 3) 에피사이클로 재현.<br/>
+      실행은 로컬 서버로 띄우세요. (아래 설명 참고)
+    </small>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+
+    // -----------------------
+    // Three.js 기본 세팅 (2D 느낌으로 Orthographic)
+    // -----------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+
+    let camera = makeOrthoCamera();
+    function makeOrthoCamera() {
+      const w = window.innerWidth, h = window.innerHeight;
+      const aspect = w / h;
+      const view = 400; // world units
+      const cam = new THREE.OrthographicCamera(
+        -view * aspect, view * aspect, view, -view, -2000, 2000
+      );
+      cam.position.set(0, 0, 10);
+      cam.lookAt(0, 0, 0);
+      return cam;
+    }
+
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera = makeOrthoCamera();
+    });
+
+    // -----------------------
+    // UI
+    // -----------------------
+    const fileEl = document.getElementById('file');
+    const samplesEl = document.getElementById('samples');
+    const circlesEl = document.getElementById('circles');
+    const speedEl = document.getElementById('speed');
+    const samplesVal = document.getElementById('samplesVal');
+    const circlesVal = document.getElementById('circlesVal');
+    const speedVal = document.getElementById('speedVal');
+
+    samplesEl.addEventListener('input', () => samplesVal.textContent = samplesEl.value);
+    circlesEl.addEventListener('input', () => circlesVal.textContent = circlesEl.value);
+    speedEl.addEventListener('input', () => speedVal.textContent = speedEl.value);
+
+    document.getElementById('restart').addEventListener('click', () => restart());
+    document.getElementById('pause').addEventListener('click', () => togglePause());
+    document.getElementById('clear').addEventListener('click', () => clearTrail());
+    document.getElementById('demo').addEventListener('click', () => loadDemoSVG());
+
+    fileEl.addEventListener('change', async (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      const text = await f.text();
+      await loadFromSvgText(text);
+    });
+
+    // -----------------------
+    // 에피사이클 데이터 구조
+    // -----------------------
+    /**
+     * comp: { freq:int, re:number, im:number, amp:number, phase:number }
+     */
+    let comps = [];
+    let nCircles = 250;
+    let t = 0;            // [0,1)
+    let paused = false;
+
+    // -----------------------
+    // 렌더 오브젝트들 (원, 팔, 궤적)
+    // -----------------------
+    const group = new THREE.Group();
+    scene.add(group);
+
+    let armsLine = null;
+    let circlesLines = null;
+    let trailLine = null;
+
+    let trailPoints = [];            // THREE.Vector3[]
+    const TRAIL_MAX = 6000;
+
+    function clearSceneGroup() {
+      while (group.children.length) group.remove(group.children[0]);
+      armsLine = null;
+      circlesLines = null;
+      trailLine = null;
+    }
+
+    function clearTrail() {
+      trailPoints = [];
+      if (trailLine) {
+        trailLine.geometry.dispose();
+        group.remove(trailLine);
+        trailLine = null;
+      }
+    }
+
+    function togglePause() {
+      paused = !paused;
+      document.getElementById('pause').textContent = paused ? 'Resume' : 'Pause';
+    }
+
+    function restart() {
+      t = 0;
+      clearTrail();
+    }
+
+    // -----------------------
+    // 수학 유틸 (DFT)
+    // -----------------------
+    function dftComplex(samples) {
+      // samples: Array<{x,y}> as complex z = x + i y
+      const N = samples.length;
+      const out = new Array(N);
+
+      for (let k = 0; k < N; k++) {
+        let re = 0, im = 0;
+        for (let n = 0; n < N; n++) {
+          const phi = (2 * Math.PI * k * n) / N;
+          // z_n * e^{-i phi}
+          const x = samples[n].x;
+          const y = samples[n].y;
+          // (x + i y) * (cos(phi) - i sin(phi))
+          re += x * Math.cos(phi) + y * Math.sin(phi);
+          im += -x * Math.sin(phi) + y * Math.cos(phi);
+        }
+        re /= N;
+        im /= N;
+
+        const freq = (k <= N / 2) ? k : (k - N); // 음수 주파수로 매핑
+        const amp = Math.hypot(re, im);
+        const phase = Math.atan2(im, re);
+
+        out[k] = { freq, re, im, amp, phase };
+      }
+
+      // amp 큰 순으로 정렬
+      out.sort((a, b) => b.amp - a.amp);
+      return out;
+    }
+
+    function epicycleTip(tNorm) {
+      const use = comps.slice(0, nCircles);
+      let x = 0, y = 0;
+      const joints = [{ x, y }];
+
+      for (const c of use) {
+        const angle = 2 * Math.PI * c.freq * tNorm + c.phase;
+        x += c.amp * Math.cos(angle);
+        y += c.amp * Math.sin(angle);
+        joints.push({ x, y });
+      }
+      return { tip: { x, y }, joints };
+    }
+
+    // -----------------------
+    // SVG -> 점 샘플링
+    // -----------------------
+    function samplePointsFromSVG(svgText, targetN) {
+      const loader = new SVGLoader();
+      const data = loader.parse(svgText);
+
+      // SVGLoader는 path -> shapes 형태로 제공하지만,
+      // 여기서는 "윤곽선" 느낌으로 stroke path를 점으로 샘플링하기 위해,
+      // 원본 path의 subPath들을 따라가며 getPoint() 샘플을 얻는 방식이 제일 단순함.
+      // SVGLoader 내부가 Path 기반이 아니라서, 아래는 "shape의 contour"를 따라 샘플링한다.
+      // (복잡한 SVG에서 완벽하지 않을 수 있음. 단순 로고/라인아트면 잘 맞음.)
+      const points = [];
+
+      // shapes -> Shape.getPoints() 사용
+      for (const p of data.paths) {
+        const shapes = SVGLoader.createShapes(p);
+        for (const s of shapes) {
+          // contour points
+          const pts = s.getPoints(200);
+          for (const v of pts) points.push({ x: v.x, y: v.y });
+        }
+      }
+
+      if (points.length < 4) throw new Error("SVG에서 충분한 점을 추출하지 못했습니다.");
+
+      // 점들을 targetN개로 리샘플(균일 인덱스)
+      const res = [];
+      for (let i = 0; i < targetN; i++) {
+        const idx = Math.floor((i / targetN) * points.length);
+        res.push(points[idx]);
+      }
+
+      // 중앙 정렬 + 스케일 정규화
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const p of res) {
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+      }
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      const size = Math.max(maxX - minX, maxY - minY) || 1;
+
+      // world space로 적당히 맞추기
+      const scale = 300 / size;
+
+      for (const p of res) {
+        p.x = (p.x - cx) * scale;
+        p.y = (p.y - cy) * scale;
+      }
+
+      return res;
+    }
+
+    // -----------------------
+    // Three.js 라인 생성/업데이트
+    // -----------------------
+    function makeLine(points3, colorHex = 0xffffff, linewidth = 1) {
+      const geom = new THREE.BufferGeometry().setFromPoints(points3);
+      const mat = new THREE.LineBasicMaterial({ color: colorHex });
+      return new THREE.Line(geom, mat);
+    }
+
+    function updateArmsAndCircles(joints) {
+      // 팔(관절 polyline)
+      const armPts = joints.map(p => new THREE.Vector3(p.x, p.y, 0));
+      if (!armsLine) {
+        armsLine = makeLine(armPts, 0xdddddd);
+        group.add(armsLine);
+      } else {
+        armsLine.geometry.dispose();
+        armsLine.geometry = new THREE.BufferGeometry().setFromPoints(armPts);
+      }
+
+      // 원들: 각 joint에서 다음 joint까지 거리 = 반지름
+      // 원은 폴리라인(60 세그먼트)로 그려서 가볍게.
+      const circlePts = [];
+      const SEG = 60;
+      for (let i = 0; i < joints.length - 1; i++) {
+        const cx = joints[i].x, cy = joints[i].y;
+        const nx = joints[i + 1].x, ny = joints[i + 1].y;
+        const r = Math.hypot(nx - cx, ny - cy);
+
+        for (let s = 0; s <= SEG; s++) {
+          const th = (2 * Math.PI * s) / SEG;
+          circlePts.push(new THREE.Vector3(cx + r * Math.cos(th), cy + r * Math.sin(th), 0));
+        }
+        // break (NaN 대신 라인 분리: 여기선 한 줄로 이어져도 큰 문제 없지만, 보기 좋게 아주 짧게 끊어줌)
+        circlePts.push(new THREE.Vector3(NaN, NaN, NaN));
+      }
+
+      const filtered = circlePts.filter(v => Number.isFinite(v.x) && Number.isFinite(v.y));
+      if (!circlesLines) {
+        circlesLines = makeLine(filtered, 0x666666);
+        group.add(circlesLines);
+      } else {
+        circlesLines.geometry.dispose();
+        circlesLines.geometry = new THREE.BufferGeometry().setFromPoints(filtered);
+      }
+    }
+
+    function pushTrailPoint(p) {
+      trailPoints.push(new THREE.Vector3(p.x, p.y, 0));
+      if (trailPoints.length > TRAIL_MAX) trailPoints.shift();
+
+      if (!trailLine) {
+        trailLine = makeLine(trailPoints, 0x4aa3ff);
+        group.add(trailLine);
+      } else {
+        trailLine.geometry.dispose();
+        trailLine.geometry = new THREE.BufferGeometry().setFromPoints(trailPoints);
+      }
+    }
+
+    // -----------------------
+    // 로딩/계산 파이프라인
+    // -----------------------
+    async function loadFromSvgText(svgText) {
+      const N = parseInt(samplesEl.value, 10);
+      nCircles = parseInt(circlesEl.value, 10);
+
+      clearSceneGroup();
+      clearTrail();
+
+      const samples = samplePointsFromSVG(svgText, N);
+      comps = dftComplex(samples);
+
+      // 시작점부터 한 프레임 그려서 화면에 바로 보이게
+      const { tip, joints } = epicycleTip(0);
+      updateArmsAndCircles(joints);
+      pushTrailPoint(tip);
+
+      restart();
+    }
+
+    async function loadDemoSVG() {
+      // 간단 데모 SVG(하트 비슷한 path)
+      const demo = `
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="-50 -50 100 100">
+        <path d="M0,-10 C-20,-35 -50,-5 0,40 C50,-5 20,-35 0,-10 Z" fill="none" stroke="black"/>
+      </svg>`;
+      await loadFromSvgText(demo);
+    }
+
+    // -----------------------
+    // 애니메이션 루프
+    // -----------------------
+    let last = performance.now();
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+
+      // UI 반영
+      nCircles = parseInt(circlesEl.value, 10);
+      const speed = parseFloat(speedEl.value);
+
+      if (!paused && comps.length) {
+        // t는 [0,1) 한 바퀴가 그림 한 바퀴
+        t = (t + dt * 0.12 * speed) % 1.0;
+
+        const { tip, joints } = epicycleTip(t);
+        updateArmsAndCircles(joints);
+        pushTrailPoint(tip);
+      }
+
+      renderer.render(scene, camera);
+    }
+    requestAnimationFrame(animate);
+
+    // 처음엔 데모 하나 띄우기
+    loadDemoSVG();
+  </script>
+</body>
+</html>
