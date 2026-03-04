@@ -20,6 +20,15 @@
     #ui button { cursor: pointer; }
   </style>
 
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body,{delimiters:[
+      {left:'$$', right:'$$', display:true},
+      {left:'\\(', right:'\\)', display:false}
+    ]});">
+  </script>
+
   <script type="importmap">
   {
     "imports": {
@@ -79,6 +88,28 @@
       기본 동작: Circle 10 → 800까지 1씩 증가, 각 Circle마다 1회 드로잉(한 바퀴) 완료 후 trail을 옅게 고정(ghost).<br/>
       SVG 좌표계(Y down) → Three.js(Y up) 보정 포함.
     </small>
+  </div>
+
+  <div id="mathPanel" style="
+    position:fixed; right:12px; top:12px; z-index:10;
+    width:min(520px, calc(100vw - 24px));
+    max-height:calc(100vh - 24px); overflow:auto;
+    background:rgba(0,0,0,.55);
+    border:1px solid rgba(255,255,255,.15);
+    padding:10px 12px; border-radius:10px; backdrop-filter:blur(6px);
+    font-size:12px; line-height:1.35;
+  ">
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+      <b>Math</b>
+      <button id="toggleMath">Hide</button>
+      <span id="mathState" style="opacity:.75;"></span>
+    </div>
+  
+    <div id="mathContent">
+      <div id="mathEq"></div>
+      <hr style="border:none; border-top:1px solid rgba(255,255,255,.15); margin:10px 0;">
+      <div id="mathVars"></div>
+    </div>
   </div>
 
   <script type="module">
@@ -177,6 +208,7 @@
       if (!f) return;
       const text = await f.text();
       await loadFromSvgText(text);
+      renderMathBlock();
     });
 
     // -----------------------
@@ -551,6 +583,95 @@
       oldTrail.userData.removeAfterFade = true;
     }
 
+    // ---- Math panel ----
+    const mathPanel = document.getElementById('mathPanel');
+    const mathEq = document.getElementById('mathEq');
+    const mathVars = document.getElementById('mathVars');
+    const toggleMathBtn = document.getElementById('toggleMath');
+    const mathContent = document.getElementById('mathContent');
+    const mathState = document.getElementById('mathState');
+    
+    let showMath = true;
+    toggleMathBtn.addEventListener('click', () => {
+      showMath = !showMath;
+      mathContent.style.display = showMath ? 'block' : 'none';
+      toggleMathBtn.textContent = showMath ? 'Hide' : 'Show';
+    });
+    
+    // LaTeX(고정) 템플릿
+    const LATEX_BLOCK = String.raw`
+    $$
+    \begin{aligned}
+    &\textbf{Signal:} && z_n = x_n + i y_n,\quad n=0,\dots,N-1 \\[4pt]
+    &\textbf{DFT:} && C_k = \frac{1}{N}\sum_{n=0}^{N-1} z_n\,e^{-i 2\pi kn/N} \\[4pt]
+    &\textbf{Amp/Phase:} && A_k = |C_k|,\quad \phi_k=\arg(C_k) \\[4pt]
+    &\textbf{Reconstruct:} && \hat z(t)=\sum_{k\in\mathcal{K}} C_k\,e^{i 2\pi k t} \\[4pt]
+    &\textbf{Tip:} && 
+    \hat x(t)=\sum_{k\in\mathcal{K}} A_k\cos(2\pi k t+\phi_k),\quad
+    \hat y(t)=\sum_{k\in\mathcal{K}} A_k\sin(2\pi k t+\phi_k) \\[4pt]
+    &\textbf{Joints:} && J_0(t)=0,\quad J_m(t)=\sum_{j=1}^{m} C_{k_j}e^{i2\pi k_j t}
+    \end{aligned}
+    $$
+    `;
+    
+    // KaTeX 렌더(초기 1회)
+    function renderMathBlock() {
+      if (!window.katex) {
+        mathEq.textContent = "KaTeX loading...";
+        return;
+      }
+      mathEq.innerHTML = LATEX_BLOCK;
+      // auto-render가 이미 DOM 전체를 훑지만, 동적 삽입 대비해서 한 번 더:
+      if (window.renderMathInElement) {
+        window.renderMathInElement(mathEq, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "\\(", right: "\\)", display: false }
+          ]
+        });
+      }
+    }
+    
+    // 수치 표시(매 프레임 갱신)
+    function updateMathVars({
+      N,
+      K,
+      t,
+      tipX,
+      tipY,
+      speed,
+      scale,
+      autoEnabled,
+      isRunning,
+      loopFinal,
+      curCircle,
+      maxCircle,
+      topFreqs // [{freq, amp, phase}, ...]
+    }) {
+      // 너무 자주 DOM 갱신하면 부담 → 10fps 정도로 제한 가능
+      const lines = [];
+    
+      lines.push(`<b>State</b>`);
+      lines.push(`N (samples) = <b>${N}</b>`);
+      lines.push(`K (circles used) = <b>${K}</b> / max ${maxCircle}`);
+      lines.push(`t ∈ [0,1) = <b>${t.toFixed(4)}</b>`);
+      lines.push(`tip (x,y) = (<b>${tipX.toFixed(2)}</b>, <b>${tipY.toFixed(2)}</b>)`);
+      lines.push(`speed = <b>${speed.toFixed(2)}</b>, scale = <b>${scale.toFixed(2)}</b>`);
+      lines.push(`autoRun = <b>${autoEnabled}</b>, isRunning = <b>${isRunning}</b>, loopFinal = <b>${loopFinal}</b>`);
+      lines.push(`circle slider = <b>${curCircle}</b> / ${maxCircle}`);
+    
+      if (topFreqs && topFreqs.length) {
+        lines.push(`<div style="margin-top:8px;"><b>Top components (by amplitude)</b></div>`);
+        lines.push(`<div style="opacity:.85;">freq / amp / phase</div>`);
+        for (const c of topFreqs) {
+          lines.push(`k=${c.freq}, A=${c.amp.toFixed(2)}, φ=${c.phase.toFixed(2)}`);
+        }
+      }
+    
+      mathVars.innerHTML = `<div style="white-space:pre-line;">${lines.join("\n")}</div>`;
+      mathState.textContent = `${autoEnabled ? "AUTO" : "MANUAL"} • ${isRunning ? "drawing" : (loopFinal ? "looping" : "idle")}`;
+    }    
+
     // -----------------------
     // 로딩/계산
     // -----------------------
@@ -585,6 +706,7 @@
         <path d="M0,-10 C-20,-35 -50,-5 0,40 C50,-5 20,-35 0,-10 Z" fill="none" stroke="black"/>
       </svg>`;
       await loadFromSvgText(demo);
+      renderMathBlock();
     }
 
     // -----------------------
@@ -647,6 +769,40 @@
       updateArmsAndCircles(joints);
       pushTrailPoint(tip);
 
+      // ---- math panel update (throttle) ----
+      if (!animate._lastMath || (now - animate._lastMath) > 100) { // 10fps
+        animate._lastMath = now;
+      
+        const N = parseInt(samplesEl.value, 10);
+        const K = nCircles;
+        const speed = parseFloat(speedEl.value);
+        const scale = parseFloat(scaleEl.value);
+        const curCircle = parseInt(circlesEl.value, 10);
+      
+        // 상위 성분 몇 개만 보여주기(너무 많으면 UI가 지저분)
+        const top = comps.slice(0, 5).map(c => ({
+          freq: c.freq,
+          amp: c.amp,
+          phase: c.phase
+        }));
+      
+        updateMathVars({
+          N,
+          K,
+          t,
+          tipX: tip.x,
+          tipY: tip.y,
+          speed,
+          scale,
+          autoEnabled: autoRun.enabled,
+          isRunning: autoRun.isRunning,
+          loopFinal,
+          curCircle,
+          maxCircle: autoRun.max,
+          topFreqs: top
+        });
+      }      
+
       // ---- (요구사항 3) 한 바퀴(드로잉 1회) 완료 감지 ----
       // t가 0으로 래핑되면 "한 번의 드로잉 끝"
       if (autoRun.enabled && autoRun.isRunning) {
@@ -687,5 +843,6 @@
   </script>
 </body>
 </html>
+
 
 
