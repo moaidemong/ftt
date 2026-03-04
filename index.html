@@ -56,10 +56,17 @@
     </div>
 
     <div class="row">
-  <label>Scale</label>
-  <input id="scale" type="range" min="0.2" max="3.0" step="0.05" value="1.0" />
-  <span id="scaleVal">1.0</span>
-</div>
+      <label>Scale</label>
+      <input id="scale" type="range" min="0.2" max="3.0" step="0.05" value="1.0" />
+      <span id="scaleVal">1.0</span>
+    </div>
+
+    <div class="row">
+      <button id="restart">Restart</button>
+      <button id="pause">Pause</button>
+      <button id="clear">Clear Trail</button>
+      <button id="autofit">Auto Fit</button>
+    </div>
 
     <div class="row">
       <button id="restart">Restart</button>
@@ -88,6 +95,8 @@
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x111111);
 
+    let baseSamples = []; // 현재 로드된 SVG에서 샘플링된 점들 [{x,y}, ...] (스케일 적용 전 기준)
+    
     let camera = makeOrthoCamera();
     function makeOrthoCamera() {
       const w = window.innerWidth, h = window.innerHeight;
@@ -131,6 +140,8 @@
     document.getElementById('pause').addEventListener('click', () => togglePause());
     document.getElementById('clear').addEventListener('click', () => clearTrail());
     document.getElementById('demo').addEventListener('click', () => loadDemoSVG());
+
+    document.getElementById('autofit').addEventListener('click', () => autoFit());
 
     fileEl.addEventListener('change', async (e) => {
       const f = e.target.files?.[0];
@@ -354,10 +365,43 @@
       }
     }
 
+    function computeBBox(points) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of points) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  return { minX, minY, maxX, maxY, w: (maxX - minX), h: (maxY - minY) };
+}
+
+  function autoFit(padding = 1.15) {
+    if (!baseSamples || baseSamples.length < 2) return;
+  
+    const bbox = computeBBox(baseSamples);
+    if (!(bbox.w > 0) || !(bbox.h > 0)) return;
+  
+    // Orthographic camera가 보여주는 월드 단위 폭/높이
+    const viewW = (camera.right - camera.left);
+    const viewH = (camera.top - camera.bottom);
+  
+    // group.scale = s 일 때, bbox도 s배로 커짐 → 화면에 들어오게 s 계산
+    const s = Math.min(viewW / (bbox.w * padding), viewH / (bbox.h * padding));
+  
+    // 슬라이더 + group scale 동기화
+    const clamped = Math.max(parseFloat(scaleEl.min), Math.min(parseFloat(scaleEl.max), s));
+    scaleEl.value = clamped.toFixed(2);
+    scaleVal.textContent = scaleEl.value;
+    group.scale.setScalar(parseFloat(scaleEl.value));
+  }
+
     // -----------------------
     // 로딩/계산 파이프라인
     // -----------------------
     async function loadFromSvgText(svgText) {
+      
       const N = parseInt(samplesEl.value, 10);
       nCircles = parseInt(circlesEl.value, 10);
 
@@ -365,14 +409,16 @@
       clearTrail();
 
       const samples = samplePointsFromSVG(svgText, N);
+      baseSamples = samples;   // <-- 추가
       comps = dftComplex(samples);
 
       // 시작점부터 한 프레임 그려서 화면에 바로 보이게
       const { tip, joints } = epicycleTip(0);
       updateArmsAndCircles(joints);
       pushTrailPoint(tip);
-
+      
       restart();
+      autoFit(); // <-- 로드하면 자동으로 화면에 맞춤      
     }
 
     async function loadDemoSVG() {
@@ -420,3 +466,4 @@
 </body>
 
 </html>
+
