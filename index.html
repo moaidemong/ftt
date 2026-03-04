@@ -56,6 +56,12 @@
     </div>
 
     <div class="row">
+  <label>Scale</label>
+  <input id="scale" type="range" min="0.2" max="3.0" step="0.05" value="1.0" />
+  <span id="scaleVal">1.0</span>
+</div>
+
+    <div class="row">
       <button id="restart">Restart</button>
       <button id="pause">Pause</button>
       <button id="clear">Clear Trail</button>
@@ -107,6 +113,12 @@
     const samplesEl = document.getElementById('samples');
     const circlesEl = document.getElementById('circles');
     const speedEl = document.getElementById('speed');
+
+    const scaleEl = document.getElementById('scale');
+    const scaleVal = document.getElementById('scaleVal');
+
+    scaleEl.addEventListener('input', () => scaleVal.textContent = scaleEl.value);
+    
     const samplesVal = document.getElementById('samplesVal');
     const circlesVal = document.getElementById('circlesVal');
     const speedVal = document.getElementById('speedVal');
@@ -173,6 +185,9 @@
     }
 
     function restart() {
+      scaleEl.value = "1.0";
+      scaleVal.textContent = "1.0";
+      group.scale.setScalar(1.0);
       t = 0;
       clearTrail();
     }
@@ -383,6 +398,9 @@
       nCircles = parseInt(circlesEl.value, 10);
       const speed = parseFloat(speedEl.value);
 
+      const uiScale = parseFloat(scaleEl.value);
+      group.scale.setScalar(uiScale);
+
       if (!paused && comps.length) {
         // t는 [0,1) 한 바퀴가 그림 한 바퀴
         t = (t + dt * 0.12 * speed) % 1.0;
@@ -400,4 +418,5 @@
     loadDemoSVG();
   </script>
 </body>
+
 </html>
